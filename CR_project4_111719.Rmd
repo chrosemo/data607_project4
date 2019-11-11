@@ -1,0 +1,235 @@
+---
+title: "Project 4 - Spam/Ham"
+author: "C. Rosemond 111719"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Summary and Sources
+I trained three models to classify emails by spam status (spam = 1). Of the three, the Linear Support Vector Machine using weighted classes proved the most accurate. With an accuracy of approximately 0.7662, the model exceeds the minimum standard of accuracy per the no information rate. It could serve as a starting point for further tuning.
+
+The data source is https://spamassassin.apache.org/old/publiccorpus/; I used the 20021010_easy_ham and 20030228_spam_2 corpuses.
+
+My work draws heavily from two resources: an overview on text classification using R (Hvitfeldt) and a walk-through from a Computing for Social Sciences course at the University of Chicago (Soltoff). I had intended to use Chapter 10 from Automated Data Collection with R, but the text relies on a library, RTextTools, that is no longer supported and thus unavailable on CRAN.
+
+Hvitfeldt, E. (2019). "Binary text classification with tidytext and caret". Retrieved from https://www.hvitfeldt.me/blog/binary-text-classification-with-tidytext-and-caret/
+
+Soltoff, B. (2019). "Supervised classification with text data". Retrieved from https://cfss.uchicago.edu/notes/supervised-text-classification/
+
+<br>
+
+### Libraries
+```{r libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tidytext)
+library(stringr)
+library(caret)
+library(tm)
+library(SnowballC)
+```
+
+<br>
+
+### Extracting and Cleaning
+I begin by reading in the files and, ultimately, storing them in a combined data frame with variables for file number, file text (starting from a blank row in the file), and spam label (1 for spam and 0 for ham).
+
+```{r extracting, eval=TRUE, warning=FALSE}
+#Files
+spam_files <- dir('spam_2/')
+ham_files <- dir('easy_ham/')
+
+#Emails
+#Spam
+spam_emails <- c()
+for(i in 1:length(spam_files)) {
+  file <- paste0('spam_2/', spam_files[i])
+  con <- file(file, open="rb", encoding="latin1")
+  txt <- readLines(con)
+  msg <- txt[seq(which(txt=="")[1]+1, length(txt), 1)]
+  close(con)
+  email <- c(i,paste(msg, collapse=" "))
+  spam_emails <- rbind(spam_emails, email)
+}
+spam <- data.frame(spam_emails, stringsAsFactors=FALSE, row.names=NULL)
+names(spam) <- c('num', 'txt')
+spam <- mutate(spam, spam = 1)
+
+#Ham
+ham_emails <- c()
+for(i in 1:length(ham_files)) {
+  file <- paste0('easy_ham/', ham_files[i])
+  con <- file(file, open="rb", encoding="latin1")
+  txt <- readLines(con)
+  msg <- txt[seq(which(txt=="")[1]+1, length(txt), 1)]
+  close(con)
+  email <- c(i,paste(msg, collapse=" "))
+  ham_emails <- rbind(ham_emails, email)
+}
+ham <- data.frame(ham_emails, stringsAsFactors=FALSE, row.names=NULL)
+names(ham) <- c('num', 'txt')
+ham <- mutate(ham, spam = 0)
+
+#Combined
+set.seed(11172019)
+spam_ham <- bind_rows(spam, ham)
+spam_ham$spam <- as.character(spam_ham$spam)
+spam_ham <- spam_ham[sample(nrow(spam_ham)),]
+```
+
+<br>
+
+Next, I unnest the email text into individual words/objects and then remove (as best I can) numbers, html tags and other punctuation, and stop words. The last are commonly used words (an,in, etc.) that are typically ignored in natural language processing and other text analyses. Lastly, I stem the words, or reduce the resulting words to their root forms.
+
+```{r cleaning, eval=TRUE}
+tokens <- spam_ham %>%
+    unnest_tokens(output = word, input = txt) %>%
+    # remove numbers
+    filter(!str_detect(word, '^[[:digit:]]*$')) %>%
+    filter(!str_detect(word, '\\B[[:digit:]]*$')) %>%
+    filter(!str_detect(word, '^*[[:digit:]]')) %>%
+    # remove html tags
+    filter(!str_detect(word, '<(.+?)>')) %>%
+    # remove other punctuation
+    filter(!str_detect(word, '^[[:punct:]]*$')) %>%
+    filter(!str_detect(word, '\\B[[:punct:]]*$')) %>%
+    filter(!str_detect(word, '^*[[:punct:]]')) %>%
+    # remove stop words
+    anti_join(stop_words) %>%
+    # stem the words
+    mutate(word = wordStem(word))
+head(tokens)
+```
+
+<br>
+
+I check the top 10 tokens among ham (0) and spam (1) documents. Among ham documents, 'exmh', 'razor', and 'pgp' are the most frequent tokens. Among spam documents, 'helvetica', 'serif', and 'tbodi' are the most frequent tokens.
+
+```{r words, eval=TRUE}
+dtm_tfidf <- tokens %>%
+  count(spam, word) %>%
+  bind_tf_idf(term = word, document = spam, n = n)
+dtm_plot <- dtm_tfidf %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word))))
+#Top 10 words for ham (0) and spam (1)
+dtm_plot %>%
+  group_by(spam) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, tf_idf, spam)) %>%
+  ggplot(aes(word, tf_idf)) +
+  geom_col() +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ spam, scales = "free") +
+  coord_flip()
+```
+
+<br>
+
+### Building a Document Term Matrix
+Next, I convert the tokens data frame into a document term matrix to facilitate analysis. The matrix has a row for each file, or document, and a column associated with each token, or word. The cells contain counts of each token in each document.
+
+I use the default weighting approach, known as term frequency weighting, based on the counts of tokens in each document.
+
+```{r weighting1, eval=TRUE}
+dtm <- tokens %>%
+   # get count of each token in each document
+   count(num, word) %>%
+   # create a document-term matrix with all features and tf weighting
+   cast_dtm(document = num, term = word, value = n)
+dtm
+```
+
+<br>
+
+Considering the 100% sparsity--all cells, regardless of count, are included in the matrix--I remove sparse terms based on a threshold of .99. That is, I remove tokens that appear in less than or equal to 1% of all documents in the matrix. Doing so reduces the number of tokens from 25,532 to 2,060 and the maximal term length from 121 characters to 33. The resulting sparsity is 96%.
+
+```{r sparsity, eval=TRUE}
+dtm <- removeSparseTerms(dtm, sparse = .99)
+dtm
+```
+
+<br>
+
+### Sampling
+I first create a meta tibble based upon the clean spam_ham data frame and then build an index based on the variable of interest, spam status. I sample from the document term matrix using the index, with approximately 80% of the documents falling into the training set and the balance in the test set.
+
+```{r meta, eval=TRUE}
+meta <- tibble(num = dimnames(dtm)[[1]]) %>%
+  left_join(spam_ham[!duplicated(spam_ham$num), ], by = "num")
+```
+
+```{r sample, eval=TRUE}
+set.seed(11172019)
+train_index <- createDataPartition(meta$spam, p=0.80, list = FALSE, times = 1)
+# Create Training Data
+train <- dtm[train_index, ] %>% as.matrix() %>% as.data.frame()
+test <- dtm[-train_index, ] %>% as.matrix() %>% as.data.frame()
+```
+
+<br>
+
+### Modeling
+I build three different models (Linear Support Vector Machines with Class Weights (svm), Naive Bayes (nb), and Random Forest (rf)) to predict spam status and then compare the results. For each model, I use default parameters.
+
+<br>
+
+#### Linear Support Vector Machines with Class Weights
+This model shows an accuracy of approximately 0.7662, which, on its own, exceeds the No Information Rate of 0.721. The No Information Rate refers to the predicted accuracy given always predicting the most common class (ham). The model has a test p-value of approximately 0.012.
+
+```{r svm, eval=TRUE}
+svm <- train(x = train,
+                 y = as.factor(meta$spam[train_index]),
+                 method = 'svmLinearWeights2',
+                 trControl = trainControl(method = 'none'),
+                 tuneGrid = data.frame(cost = 1, Loss = 0, weight = 1))
+svm_predict <- predict(svm, newdata = test)
+svm_cm <- confusionMatrix(svm_predict, as.factor(meta[-train_index, ]$spam))
+svm_cm
+```
+
+<br>
+
+#### Naive Bayes
+This model shows an accuracy of approximately 0.7367, which, on its own, exceeds the No Information Rate of 0.721. It has a test p-value of approximately 0.2303.
+
+```{r naivebayes, eval=TRUE}
+nb <- train(x = train,
+                y = as.factor(meta$spam[train_index]),
+                method = 'naive_bayes',
+                trControl = trainControl(method = 'none'),
+                tuneGrid = data.frame(laplace = 0, usekernel = FALSE, adjust = FALSE))
+nb_predict <- predict(nb, newdata = test)
+nb_cm <- confusionMatrix(nb_predict, as.factor(meta[-train_index, ]$spam))
+nb_cm
+```
+
+<br>
+
+#### Random Forest
+This model shows an accuracy of approximately 0.725, which, on its own, just exceeds the no information rate of 0.721. It has a Kappa score of approximately 0.44390.
+
+```{r randomforest, eval=TRUE}
+rf <- train(x = train, 
+                y = as.factor(meta$spam[train_index]), 
+                method = 'ranger',
+                trControl = trainControl(method = 'none'),
+                tuneGrid = data.frame(mtry = floor(sqrt(dim(train)[2])), splitrule = 'gini', min.node.size = 1))
+rf_predict <- predict(rf, newdata = test)
+rf_cm <- confusionMatrix(rf_predict, as.factor(meta[-train_index, ]$spam))
+rf_cm
+```
+
+<br>
+
+### Conclusion
+Without tuning, each of the three models predicts spam status with roughly 70% accuracy. All three produce an accuracy that exceeds or equals the no information rate, which is basically the minimum standard, of 0.721. The SVM model performs the best, with an accuracy of approximately 0.7662 and a test p-value of approximately 0.012.
+
+Considering the initial results, I am satisfied with the SVM model as a starting point for further tuning.
+
+
+
